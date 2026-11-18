@@ -1,0 +1,749 @@
+setup: |-
+  const Object = require('Object');
+
+  const fixtures = {
+    usnatSaleOptOut: 'DBABL~BEAaAAAAAAA',
+    usnatNoOptOut: 'DBABL~BAAqAAAAAAA',
+    usnatTargetedOptOut: 'DBABL~CAApAAAAAAA',
+    usnatGpcOnly: 'DBABL~BAAqAAAAAAA.Y',
+    usnatGpcFalse: 'DBABL~BAAqAAAAAAA.Q',
+    usnatNotApplicable: 'DBABL~BAAAAAAAAAA',
+    usnatV3: 'DBABL~DAAQAAAAAAA',
+    uscaSharingOptOut: 'DBABBg~BAkAAAAA',
+    usvaSaleOptOut: 'DBABRg~BAYAAAA',
+    uscoTargetedOptOut: 'DBABJg~BAkAAAA',
+    usutSaleOptOut: 'DBABFg~BAGAAAA',
+    usctNoOptOut: 'DBABVg~BAoAAAA',
+    multiTcfUsnatUsca: 'DBADMNg~CPXxRfAPXxRfAAfKABENB-CgAAAAAAAAAAYgAAAAAAAA~BAAqAAAAAAA~BAYAAAAA',
+    multiRanges: 'DBABrY~BAAqAAAAAAA~BAoAAAAA~BAYAAAA',
+    uspv1: 'DBABT~1YYN',
+    unsupportedFlorida: 'DBABAw~BAAAAAA',
+    officialUsnatGpc: 'DBABLA~CEAqAAAAAABA.YA',
+    officialUscaSaleOptOut: 'DBABBg~BAYAAABA.QA',
+    officialMultiNoOptOut: 'DBACzzA~1YNN~CAAqAAAAAABA.QA~BAoAABA'
+  };
+
+  const assign = (target, source) => {
+    Object.keys(source || {}).forEach((key) => {
+      target[key] = source[key];
+    });
+    return target;
+  };
+
+  const createMockData = (overrides) => {
+    return assign(
+      {
+        returnType: 'object',
+        optOutAction: 'limited',
+        resolutionMode: 'anyOptOut',
+        noSignalBehavior: 'allow',
+        signalPriority: [
+          { signal: 'gpc' },
+          { signal: 'gpp' },
+          { signal: 'us_privacy' },
+          { signal: 'cmp' },
+          { signal: 'consent_mode' }
+        ],
+        enableGpc: true,
+        enableGpp: true,
+        enableUsPrivacy: true,
+        enableCmp: false,
+        enableConsentMode: false,
+        regionScope: 'us',
+        regionStates: 'CA,CO,CT,DE,FL,IA,IN,KY,MD,MN,MT,NE,NH,NJ,OR,RI,TN,TX,UT,VA',
+        unknownGeoBehavior: 'apply',
+        geoSource: 'auto',
+        metaDpoMode: 'geolocation'
+      },
+      overrides
+    );
+  };
+
+  const usEventData = (extra) => {
+    return assign({ event_name: 'page_view', event_location: { country: 'US', region: 'CA' } }, extra);
+  };
+
+  const setRequest = (request) => {
+    const eventData = request.eventData === undefined ? usEventData({}) : request.eventData;
+    const headers = request.headers || {};
+    const cookies = request.cookies || {};
+    mock('getAllEventData', () => eventData);
+    mock('getRequestHeader', (name) => headers[name.toLowerCase()]);
+    mock('getCookieValues', (name) => (cookies[name] === undefined ? [] : [cookies[name]]));
+  };
+
+  setRequest({});
+scenarios:
+- name: '[Default] Returns allow when no signal is present'
+  code: |-
+    const mockData = createMockData({ returnType: undefined });
+
+    assertThat(runCode(mockData)).isEqualTo('allow');
+
+    const result = runCode(createMockData({}));
+    assertThat(result.decision).isEqualTo('allow');
+    assertThat(result.restricted).isFalse();
+    assertThat(result.opted_out).isFalse();
+    assertThat(result.reason).isEqualTo('no_opt_out_signal');
+    assertThat(result.applies).isTrue();
+    assertThat(result.signals).isEqualTo({
+      gpc: 'unknown',
+      gpp: 'unknown',
+      us_privacy: 'unknown',
+      cmp: 'disabled',
+      consent_mode: 'disabled'
+    });
+    assertThat(result.vendor).isEqualTo({
+      meta: {
+        data_processing_options: [],
+        data_processing_options_country: undefined,
+        data_processing_options_state: undefined
+      },
+      google_ads: { restricted_data_processing: false },
+      tiktok: { limited_data_use: false }
+    });
+- name: '[GPC] Sec-GPC header 1 returns limited with reason gpc'
+  code: |-
+    setRequest({ headers: { 'sec-gpc': '1' } });
+
+    const result = runCode(createMockData({}));
+
+    assertThat(result.decision).isEqualTo('limited');
+    assertThat(result.restricted).isTrue();
+    assertThat(result.opted_out).isTrue();
+    assertThat(result.reason).isEqualTo('gpc');
+    assertThat(result.signals.gpc).isEqualTo('opt_out');
+    assertThat(result.details.gpc).isEqualTo({ status: 'opt_out', value: '1' });
+    assertThat(result.vendor).isEqualTo({
+      meta: {
+        data_processing_options: ['LDU'],
+        data_processing_options_country: 0,
+        data_processing_options_state: 0
+      },
+      google_ads: { restricted_data_processing: true },
+      tiktok: { limited_data_use: true }
+    });
+- name: '[GPC] Only the value 1 is an opt-out, and a disabled signal is ignored'
+  code: |-
+    [
+      { header: '1, 1', enabled: true, expected: 'opt_out' },
+      { header: ' 1 ', enabled: true, expected: 'opt_out' },
+      { header: '0', enabled: true, expected: 'unknown' },
+      { header: 'true', enabled: true, expected: 'unknown' },
+      { header: '', enabled: true, expected: 'unknown' },
+      { header: undefined, enabled: true, expected: 'unknown' },
+      { header: '1', enabled: false, expected: 'disabled' }
+    ].forEach((scenario) => {
+      setRequest({ headers: { 'sec-gpc': scenario.header } });
+
+      const result = runCode(createMockData({ enableGpc: scenario.enabled }));
+
+      assertThat(result.signals.gpc).isEqualTo(scenario.expected);
+      assertThat(result.restricted).isEqualTo(scenario.expected === 'opt_out');
+    });
+- name: '[GPP] Decodes the US National section (versions 1 and 2 and GPC sub-section)'
+  code: |-
+    [
+      { gpp: fixtures.usnatSaleOptOut, expected: 'opt_out', fields: [1, 2, 2], version: 1 },
+      { gpp: fixtures.usnatNoOptOut, expected: 'no_opt_out', fields: [2, 2, 2], version: 1 },
+      { gpp: fixtures.usnatTargetedOptOut, expected: 'opt_out', fields: [2, 2, 1], version: 2 },
+      { gpp: fixtures.usnatGpcOnly, expected: 'opt_out', fields: [2, 2, 2], version: 1, gpc: true },
+      { gpp: fixtures.usnatGpcFalse, expected: 'no_opt_out', fields: [2, 2, 2], version: 1, gpc: false },
+      { gpp: fixtures.usnatNotApplicable, expected: 'unknown', fields: [0, 0, 0], version: 1 }
+    ].forEach((scenario) => {
+      setRequest({ eventData: usEventData({ 'x-sst-system_properties': { gpp: scenario.gpp, gpp_sid: '7' } }) });
+
+      const result = runCode(createMockData({}));
+      const section = result.details.gpp.sections[0];
+
+      assertThat(result.signals.gpp).isEqualTo(scenario.expected);
+      assertThat(result.details.gpp.applicable_sections).isEqualTo([7]);
+      assertThat(section.id).isEqualTo(7);
+      assertThat(section.name).isEqualTo('usnat');
+      assertThat(section.version).isEqualTo(scenario.version);
+      assertThat(section.sale_opt_out).isEqualTo(scenario.fields[0]);
+      assertThat(section.sharing_opt_out).isEqualTo(scenario.fields[1]);
+      assertThat(section.targeted_advertising_opt_out).isEqualTo(scenario.fields[2]);
+      assertThat(section.gpc).isEqualTo(scenario.gpc);
+      assertThat(result.reason).isEqualTo(scenario.expected === 'opt_out' ? 'gpp' : 'no_opt_out_signal');
+    });
+- name: '[GPP] Decodes the state sections 8 to 12'
+  code: |-
+    [
+      { gpp: fixtures.uscaSharingOptOut, id: 8, name: 'usca', expected: 'opt_out', field: 'sharing_opt_out', value: 1 },
+      { gpp: fixtures.usvaSaleOptOut, id: 9, name: 'usva', expected: 'opt_out', field: 'sale_opt_out', value: 1 },
+      { gpp: fixtures.uscoTargetedOptOut, id: 10, name: 'usco', expected: 'opt_out', field: 'targeted_advertising_opt_out', value: 1 },
+      { gpp: fixtures.usutSaleOptOut, id: 11, name: 'usut', expected: 'opt_out', field: 'sale_opt_out', value: 1 },
+      { gpp: fixtures.usctNoOptOut, id: 12, name: 'usct', expected: 'no_opt_out', field: 'sale_opt_out', value: 2 }
+    ].forEach((scenario) => {
+      setRequest({ eventData: usEventData({ 'x-sst-system_properties': { gpp: scenario.gpp } }) });
+
+      const result = runCode(createMockData({}));
+      const section = result.details.gpp.sections[0];
+
+      assertThat(result.signals.gpp).isEqualTo(scenario.expected);
+      assertThat(section.id).isEqualTo(scenario.id);
+      assertThat(section.name).isEqualTo(scenario.name);
+      assertThat(section[scenario.field]).isEqualTo(scenario.value);
+    });
+- name: '[GPP] Decodes multi-section strings, range headers and the uspv1 section'
+  code: |-
+    setRequest({ eventData: usEventData({ 'x-sst-system_properties': { gpp: fixtures.multiTcfUsnatUsca } }) });
+    let result = runCode(createMockData({}));
+    assertThat(result.signals.gpp).isEqualTo('opt_out');
+    assertThat(result.details.gpp.sections.map((section) => section.id)).isEqualTo([2, 7, 8]);
+    assertThat(result.details.gpp.sections[0].supported).isFalse();
+    assertThat(result.details.gpp.sections[1].status).isEqualTo('no_opt_out');
+    assertThat(result.details.gpp.sections[2].status).isEqualTo('opt_out');
+
+    setRequest({ eventData: usEventData({ 'x-sst-system_properties': { gpp: fixtures.multiRanges } }) });
+    result = runCode(createMockData({}));
+    assertThat(result.signals.gpp).isEqualTo('opt_out');
+    assertThat(result.details.gpp.sections.map((section) => section.name)).isEqualTo(['usnat', 'usca', 'usva']);
+
+    setRequest({ eventData: usEventData({ 'x-sst-system_properties': { gpp: fixtures.uspv1 } }) });
+    result = runCode(createMockData({}));
+    assertThat(result.signals.gpp).isEqualTo('opt_out');
+    assertThat(result.details.gpp.sections[0]).isEqualTo({ id: 6, name: 'uspv1', value: '1YYN', status: 'opt_out' });
+- name: '[GPP] Decodes strings produced by the official IAB encoder'
+  code: |-
+    setRequest({ eventData: usEventData({ 'x-sst-system_properties': { gpp: fixtures.officialUsnatGpc } }) });
+    let result = runCode(createMockData({}));
+    let section = result.details.gpp.sections[0];
+    assertThat(result.signals.gpp).isEqualTo('opt_out');
+    assertThat(section.version).isEqualTo(2);
+    assertThat(section.sale_opt_out).isEqualTo(2);
+    assertThat(section.sharing_opt_out).isEqualTo(2);
+    assertThat(section.targeted_advertising_opt_out).isEqualTo(2);
+    assertThat(section.gpc).isTrue();
+
+    setRequest({ eventData: usEventData({ 'x-sst-system_properties': { gpp: fixtures.officialUscaSaleOptOut } }) });
+    result = runCode(createMockData({}));
+    section = result.details.gpp.sections[0];
+    assertThat(result.signals.gpp).isEqualTo('opt_out');
+    assertThat(section.name).isEqualTo('usca');
+    assertThat(section.sale_opt_out).isEqualTo(1);
+    assertThat(section.sharing_opt_out).isEqualTo(2);
+    assertThat(section.gpc).isFalse();
+
+    setRequest({ eventData: usEventData({ 'x-sst-system_properties': { gpp: fixtures.officialMultiNoOptOut } }) });
+    result = runCode(createMockData({}));
+    assertThat(result.signals.gpp).isEqualTo('no_opt_out');
+    assertThat(result.details.gpp.sections.map((item) => item.name)).isEqualTo(['uspv1', 'usnat', 'usva']);
+- name: '[GPP] Applicable section IDs limit which sections are evaluated'
+  code: |-
+    [
+      { sid: '7', expected: 'no_opt_out', applicable: [7] },
+      { sid: '8', expected: 'opt_out', applicable: [8] },
+      { sid: '2_7', expected: 'no_opt_out', applicable: [2, 7] },
+      { sid: '7,8', expected: 'opt_out', applicable: [7, 8] },
+      { sid: [7], expected: 'no_opt_out', applicable: [7] },
+      { sid: '-1', expected: 'unknown', applicable: [] },
+      { sid: undefined, expected: 'opt_out', applicable: undefined }
+    ].forEach((scenario) => {
+      setRequest({
+        eventData: usEventData({ 'x-sst-system_properties': { gpp: fixtures.multiTcfUsnatUsca, gpp_sid: scenario.sid } })
+      });
+
+      const result = runCode(createMockData({}));
+
+      assertThat(result.signals.gpp).isEqualTo(scenario.expected);
+      assertThat(result.details.gpp.applicable_sections).isEqualTo(scenario.applicable);
+    });
+- name: '[GPP] Reads the string from the override, system properties, x-ads keys, then the OneTrust cookie'
+  code: |-
+    setRequest({
+      eventData: usEventData({ 'x-ads-gpp': fixtures.usnatSaleOptOut, 'x-ads-gpp_sid': '7' }),
+      cookies: { OTGPPConsent: fixtures.usnatNoOptOut }
+    });
+    let result = runCode(createMockData({}));
+    assertThat(result.signals.gpp).isEqualTo('opt_out');
+    assertThat(result.details.gpp.source).isEqualTo('x-ads-gpp');
+    assertThat(result.details.gpp.applicable_sections).isEqualTo([7]);
+
+    setRequest({ cookies: { OTGPPConsent: fixtures.officialUscaSaleOptOut } });
+    result = runCode(createMockData({}));
+    assertThat(result.signals.gpp).isEqualTo('opt_out');
+    assertThat(result.details.gpp.source).isEqualTo('cookie_OTGPPConsent');
+    assertThat(result.details.gpp.applicable_sections).isUndefined();
+
+    setRequest({ cookies: { OTGPPConsent: 'not a gpp string!' } });
+    result = runCode(createMockData({}));
+    assertThat(result.signals.gpp).isEqualTo('unknown');
+    assertThat(result.details.gpp.error).isEqualTo('invalid_gpp_string');
+
+    setRequest({ eventData: usEventData({ 'x-sst-system_properties.gpp': fixtures.usnatSaleOptOut }) });
+    result = runCode(createMockData({}));
+    assertThat(result.signals.gpp).isEqualTo('opt_out');
+
+    setRequest({
+      eventData: usEventData({
+        'x-sst-system_properties': { gpp: fixtures.usnatNoOptOut },
+        'x-ads-gpp': fixtures.usnatSaleOptOut
+      })
+    });
+    result = runCode(createMockData({}));
+    assertThat(result.signals.gpp).isEqualTo('no_opt_out');
+
+    result = runCode(createMockData({ gppString: fixtures.usnatSaleOptOut, gppSid: '8' }));
+    assertThat(result.details.gpp.value).isEqualTo(fixtures.usnatSaleOptOut);
+    assertThat(result.signals.gpp).isEqualTo('unknown');
+- name: '[GPP] Invalid, truncated, unsupported and v3 strings are unknown'
+  code: |-
+    [
+      { gpp: 'not a gpp string!', error: 'invalid_gpp_string' },
+      { gpp: 'BBABM~1YYN', error: 'invalid_gpp_string' },
+      { gpp: 'DBAB', error: 'invalid_gpp_string' },
+      { gpp: 'DBABrlFEFUJCw~BAAqAAAAAAA', error: 'invalid_gpp_string' },
+      { gpp: 'DBABL', error: undefined, sections: 0 },
+      { gpp: fixtures.usnatV3, error: undefined, sections: 1 },
+      { gpp: fixtures.unsupportedFlorida, error: undefined, sections: 1 }
+    ].forEach((scenario) => {
+      setRequest({ eventData: usEventData({ 'x-sst-system_properties': { gpp: scenario.gpp } }) });
+
+      const result = runCode(createMockData({}));
+
+      assertThat(result.signals.gpp).isEqualTo('unknown');
+      assertThat(result.details.gpp.error).isEqualTo(scenario.error);
+      if (scenario.sections !== undefined) {
+        assertThat(result.details.gpp.sections.length).isEqualTo(scenario.sections);
+        if (scenario.sections > 0) assertThat(result.details.gpp.sections[0].supported).isFalse();
+      }
+    });
+- name: '[US Privacy] Parses the opt-out character'
+  code: |-
+    [
+      { usp: '1YYN', expected: 'opt_out' },
+      { usp: '1nyn', expected: 'opt_out' },
+      { usp: '1YNN', expected: 'no_opt_out' },
+      { usp: '1---', expected: 'unknown' },
+      { usp: '2YYN', expected: 'unknown' },
+      { usp: '1YY', expected: 'unknown' }
+    ].forEach((scenario) => {
+      setRequest({ eventData: usEventData({ 'x-sst-system_properties': { us_privacy: scenario.usp } }) });
+
+      const result = runCode(createMockData({}));
+
+      assertThat(result.signals.us_privacy).isEqualTo(scenario.expected);
+      assertThat(result.details.us_privacy.value).isEqualTo(scenario.usp);
+    });
+- name: '[US Privacy] Reads the override, event data keys and cookies in order'
+  code: |-
+    [
+      {
+        request: { eventData: usEventData({ 'x-sst-system_properties': { us_privacy: '1YNN' }, 'x-ads-us_privacy': '1YYN' }), cookies: { usprivacy: '1YYN' } },
+        overrides: { usPrivacyString: '1YYY' },
+        source: 'variable'
+      },
+      {
+        request: { eventData: usEventData({ 'x-sst-system_properties': { us_privacy: '1YNN' }, 'x-ads-us_privacy': '1YYN' }) },
+        overrides: {},
+        source: 'x-sst-system_properties.us_privacy'
+      },
+      {
+        request: { eventData: usEventData({ 'x-ads-us_privacy': '1YYN' }), cookies: { usprivacy: '1YNN' } },
+        overrides: {},
+        source: 'x-ads-us_privacy'
+      },
+      {
+        request: { cookies: { usprivacy: '1YYN', us_privacy: '1YNN' } },
+        overrides: {},
+        source: 'cookie_usprivacy'
+      },
+      {
+        request: { cookies: { us_privacy: '1YYN' } },
+        overrides: {},
+        source: 'cookie_us_privacy'
+      }
+    ].forEach((scenario) => {
+      setRequest(scenario.request);
+
+      const result = runCode(createMockData(scenario.overrides));
+
+      assertThat(result.details.us_privacy.source).isEqualTo(scenario.source);
+    });
+
+    setRequest({});
+    assertThat(runCode(createMockData({ enableUsPrivacy: false, usPrivacyString: '1YYN' })).signals.us_privacy).isEqualTo('disabled');
+- name: '[CMP OneTrust] Reads the targeting category from OptanonConsent'
+  code: |-
+    [
+      { cookie: 'isGpcEnabled=0&datestamp=x&groups=C0001%3A1%2CC0002%3A1%2CC0004%3A0', expected: 'opt_out' },
+      { cookie: 'isGpcEnabled=0&groups=C0001:1,C0004:1&geolocation=US;CA', expected: 'no_opt_out' },
+      { cookie: 'groups=C0001:1,C0002:0', expected: 'unknown' },
+      { cookie: 'datestamp=x', expected: 'unknown' },
+      { cookie: 'groups=C0001:1,C0005:0', category: 'C0005', expected: 'opt_out' },
+      { cookie: 'isGpcEnabled=1&browserGpcFlag=1&groups=C0001%3A1%2CC0004%3A1', expected: 'opt_out', browserGpc: true },
+      { cookie: 'browserGpcFlag=1&datestamp=x', expected: 'opt_out', browserGpc: true },
+      { cookie: 'isGpcEnabled=1&browserGpcFlag=0&groups=C0004:1', expected: 'no_opt_out' },
+      { cookie: undefined, expected: 'unknown', missing: true }
+    ].forEach((scenario) => {
+      setRequest({ cookies: { OptanonConsent: scenario.cookie } });
+
+      const result = runCode(
+        createMockData({ enableCmp: true, cmpPreset: 'onetrust', oneTrustCategory: scenario.category })
+      );
+
+      assertThat(result.signals.cmp).isEqualTo(scenario.expected);
+      assertThat(result.details.cmp.cookie_found).isEqualTo(!scenario.missing);
+      if (!scenario.missing) assertThat(result.details.cmp.browser_gpc).isEqualTo(scenario.browserGpc === true);
+      assertThat(result.restricted).isEqualTo(scenario.expected === 'opt_out');
+    });
+- name: '[CMP Cookiebot] Reads the marketing flag from CookieConsent'
+  code: |-
+    [
+      { cookie: "{stamp:'abc',necessary:true,preferences:true,statistics:true,marketing:false,method:'explicit',ver:1}", expected: 'opt_out' },
+      { cookie: '{stamp:%27abc%27%2Cnecessary:true%2Cmarketing:true}', expected: 'no_opt_out' },
+      { cookie: '{"necessary": true, "marketing": false}', expected: 'opt_out' },
+      { cookie: '-1', expected: 'unknown' },
+      { cookie: undefined, expected: 'unknown' }
+    ].forEach((scenario) => {
+      setRequest({ cookies: { CookieConsent: scenario.cookie } });
+
+      const result = runCode(createMockData({ enableCmp: true, cmpPreset: 'cookiebot' }));
+
+      assertThat(result.signals.cmp).isEqualTo(scenario.expected);
+      assertThat(result.details.cmp.preset).isEqualTo('cookiebot');
+    });
+- name: '[CMP TrustArc] Reads notice_gdpr_prefs first, then notice_preferences'
+  code: |-
+    [
+      { cookies: { notice_gdpr_prefs: '0,1:', notice_preferences: '2:' }, expected: 'opt_out', cookie: 'notice_gdpr_prefs' },
+      { cookies: { notice_gdpr_prefs: '0,1,2:' }, expected: 'no_opt_out', cookie: 'notice_gdpr_prefs' },
+      { cookies: { notice_preferences: '1:' }, expected: 'opt_out', cookie: 'notice_preferences' },
+      { cookies: { notice_preferences: '2:' }, expected: 'no_opt_out', cookie: 'notice_preferences' },
+      { cookies: { notice_preferences: 'abc:' }, expected: 'unknown', cookie: 'notice_preferences' },
+      { cookies: { notice_gdpr_prefs: '0,1,12:' }, expected: 'opt_out', cookie: 'notice_gdpr_prefs' },
+      { cookies: { notice_gdpr_prefs: '100:' }, expected: 'unknown', cookie: 'notice_gdpr_prefs' },
+      { cookies: { notice_gdpr_prefs: 'abc:' }, expected: 'unknown', cookie: 'notice_gdpr_prefs' },
+      { cookies: { notice_preferences: '100:' }, expected: 'unknown', cookie: 'notice_preferences' },
+      { cookies: { notice_preferences: '3:' }, expected: 'no_opt_out', cookie: 'notice_preferences' },
+      { cookies: { notice_preferences: '1:' }, category: '1', expected: 'no_opt_out', cookie: 'notice_preferences' },
+      { cookies: {}, expected: 'unknown', cookie: undefined }
+    ].forEach((scenario) => {
+      setRequest({ cookies: scenario.cookies });
+
+      const result = runCode(
+        createMockData({ enableCmp: true, cmpPreset: 'trustarc', trustArcCategory: scenario.category })
+      );
+
+      assertThat(result.signals.cmp).isEqualTo(scenario.expected);
+      assertThat(result.details.cmp.cookie).isEqualTo(scenario.cookie);
+    });
+- name: '[CMP Custom] Matches the cookie value with equals, contains and regex'
+  code: |-
+    [
+      { matchType: 'equals', cookie: 'optout', optOut: 'optout', optIn: 'optin', expected: 'opt_out' },
+      { matchType: 'equals', cookie: 'optin', optOut: 'optout', optIn: 'optin', expected: 'no_opt_out' },
+      { matchType: 'equals', cookie: 'other', optOut: 'optout', optIn: 'optin', expected: 'unknown' },
+      { matchType: 'contains', cookie: 'sale=0|share=0', optOut: 'sale=0', expected: 'opt_out' },
+      { matchType: 'regex', cookie: 'Marketing=DENIED', optOut: 'marketing=(denied|0)', expected: 'opt_out' },
+      { matchType: 'regex', cookie: 'marketing=granted', optOut: 'marketing=(denied|0)', optIn: 'granted$', expected: 'no_opt_out' },
+      { matchType: 'equals', cookie: undefined, optOut: 'optout', expected: 'unknown', missing: true }
+    ].forEach((scenario) => {
+      setRequest({ cookies: { my_consent: scenario.cookie } });
+
+      const result = runCode(
+        createMockData({
+          enableCmp: true,
+          cmpPreset: 'custom',
+          cmpCustomCookieName: 'my_consent',
+          cmpCustomMatchType: scenario.matchType,
+          cmpCustomOptOutValue: scenario.optOut,
+          cmpCustomOptInValue: scenario.optIn
+        })
+      );
+
+      assertThat(result.signals.cmp).isEqualTo(scenario.expected);
+      assertThat(result.details.cmp.cookie_found).isEqualTo(!scenario.missing);
+    });
+
+    const result = runCode(createMockData({ enableCmp: true, cmpPreset: 'custom' }));
+    assertThat(result.details.cmp).isEqualTo({ status: 'unknown', preset: 'custom', cookie_found: false });
+- name: '[Consent Mode] Reads consent_state, x-ga-gcs, npa and rdp'
+  code: |-
+    [
+      { eventData: { consent_state: { ad_storage: false, ad_user_data: true } }, expected: 'opt_out', source: 'consent_state' },
+      { eventData: { consent_state: { ad_storage: true, ad_user_data: false } }, expected: 'opt_out', source: 'consent_state' },
+      { eventData: { consent_state: { ad_storage: true }, 'x-ga-gcs': 'G100' }, expected: 'no_opt_out', source: 'consent_state' },
+      { eventData: { 'x-ga-gcs': 'G100' }, expected: 'opt_out', source: 'x-ga-gcs' },
+      { eventData: { 'x-ga-gcs': 'G111' }, expected: 'no_opt_out', source: 'x-ga-gcs' },
+      { eventData: { 'x-ga-gcs': 'G1--' }, expected: 'unknown', source: undefined },
+      { eventData: { 'x-ga-gcs': 'G111', 'x-ga-npa': '1' }, expected: 'no_opt_out', source: 'x-ga-gcs' },
+      { eventData: { 'x-ga-gcs': 'G111', 'x-ga-npa': '1' }, npa: true, expected: 'opt_out', source: 'x-ga-npa' },
+      { eventData: { 'x-ga-npa': '0' }, npa: true, expected: 'unknown', source: undefined },
+      { eventData: { 'x-sst-system_properties': { rdp: true } }, rdp: true, expected: 'opt_out', source: 'x-sst-system_properties.rdp' },
+      { eventData: { 'x-sst-system_properties': { rdp: false } }, rdp: true, expected: 'unknown', source: undefined }
+    ].forEach((scenario) => {
+      setRequest({ eventData: usEventData(scenario.eventData) });
+
+      const result = runCode(
+        createMockData({ enableConsentMode: true, consentModeUseNpa: scenario.npa, consentModeUseRdp: scenario.rdp })
+      );
+
+      assertThat(result.signals.consent_mode).isEqualTo(scenario.expected);
+      assertThat(result.details.consent_mode.source).isEqualTo(scenario.source);
+    });
+- name: '[Resolution] Any opt-out wins and the priority order picks the reason'
+  code: |-
+    setRequest({
+      headers: { 'sec-gpc': '1' },
+      cookies: { OptanonConsent: 'groups=C0004:0' },
+      eventData: usEventData({ 'x-sst-system_properties': { us_privacy: '1YNN' } })
+    });
+
+    let result = runCode(createMockData({ enableCmp: true, cmpPreset: 'onetrust' }));
+    assertThat(result.decision).isEqualTo('limited');
+    assertThat(result.reason).isEqualTo('gpc');
+
+    result = runCode(
+      createMockData({
+        enableCmp: true,
+        cmpPreset: 'onetrust',
+        signalPriority: [{ signal: 'us_privacy' }, { signal: 'cmp' }, { signal: 'gpc' }]
+      })
+    );
+    assertThat(result.decision).isEqualTo('limited');
+    assertThat(result.reason).isEqualTo('cmp');
+- name: '[Resolution] First signal with a clear answer wins in priority mode'
+  code: |-
+    setRequest({
+      headers: { 'sec-gpc': '1' },
+      cookies: { OptanonConsent: 'groups=C0004:1' }
+    });
+
+    let result = runCode(
+      createMockData({
+        resolutionMode: 'priority',
+        enableCmp: true,
+        cmpPreset: 'onetrust',
+        signalPriority: [{ signal: 'cmp' }, { signal: 'gpc' }]
+      })
+    );
+    assertThat(result.decision).isEqualTo('allow');
+    assertThat(result.opted_out).isFalse();
+    assertThat(result.reason).isEqualTo('cmp');
+
+    result = runCode(createMockData({ resolutionMode: 'priority', enableCmp: true, cmpPreset: 'onetrust' }));
+    assertThat(result.decision).isEqualTo('limited');
+    assertThat(result.reason).isEqualTo('gpc');
+
+    setRequest({ cookies: { OptanonConsent: 'groups=C0002:1' } });
+    result = runCode(createMockData({ resolutionMode: 'priority', enableCmp: true, cmpPreset: 'onetrust' }));
+    assertThat(result.decision).isEqualTo('allow');
+    assertThat(result.reason).isEqualTo('no_opt_out_signal');
+- name: '[Resolution] Priority table ignores invalid and duplicate rows and appends missing signals'
+  code: |-
+    setRequest({
+      headers: { 'sec-gpc': '1' },
+      eventData: usEventData({ 'x-sst-system_properties': { us_privacy: '1YYN' } })
+    });
+
+    const result = runCode(
+      createMockData({
+        signalPriority: [{ signal: 'bogus' }, {}, { signal: 'us_privacy' }, { signal: 'us_privacy' }]
+      })
+    );
+    assertThat(result.reason).isEqualTo('us_privacy');
+
+    const fallbackResult = runCode(createMockData({ signalPriority: 'not a table' }));
+    assertThat(fallbackResult.reason).isEqualTo('gpc');
+- name: '[Resolution] Fail closed treats visitors without a clear signal as opted out'
+  code: |-
+    [
+      { request: {}, overrides: {}, decision: 'allow', reason: 'no_opt_out_signal', optedOut: false },
+      { request: {}, overrides: { noSignalBehavior: 'optOut' }, decision: 'limited', reason: 'no_clear_signal', optedOut: true },
+      {
+        request: { eventData: usEventData({ 'x-sst-system_properties': { gpp: 'garbage!' } }) },
+        overrides: { noSignalBehavior: 'optOut', optOutAction: 'block' },
+        decision: 'block',
+        reason: 'no_clear_signal',
+        optedOut: true
+      },
+      {
+        request: { eventData: usEventData({ 'x-sst-system_properties': { us_privacy: '1YNN' } }) },
+        overrides: { noSignalBehavior: 'optOut' },
+        decision: 'allow',
+        reason: 'no_opt_out_signal',
+        optedOut: false
+      },
+      {
+        request: { cookies: { OptanonConsent: 'groups=C0004:1' } },
+        overrides: { noSignalBehavior: 'optOut', resolutionMode: 'priority', enableCmp: true, cmpPreset: 'onetrust' },
+        decision: 'allow',
+        reason: 'cmp',
+        optedOut: false
+      },
+      {
+        request: { headers: { 'sec-gpc': '1' } },
+        overrides: { noSignalBehavior: 'optOut' },
+        decision: 'limited',
+        reason: 'gpc',
+        optedOut: true
+      },
+      {
+        request: { eventData: { event_location: { country: 'BR', region: 'SP' } } },
+        overrides: { noSignalBehavior: 'optOut' },
+        decision: 'allow',
+        reason: 'region_not_applicable',
+        optedOut: true
+      }
+    ].forEach((scenario) => {
+      setRequest(scenario.request);
+
+      const result = runCode(createMockData(scenario.overrides));
+
+      assertThat(result.decision).isEqualTo(scenario.decision);
+      assertThat(result.reason).isEqualTo(scenario.reason);
+      assertThat(result.opted_out).isEqualTo(scenario.optedOut);
+    });
+- name: '[Decision] Block action returns block with restricted vendor flags'
+  code: |-
+    setRequest({ headers: { 'sec-gpc': '1' } });
+
+    const mockData = createMockData({ optOutAction: 'block', returnType: 'decision' });
+    assertThat(runCode(mockData)).isEqualTo('block');
+
+    mockData.returnType = 'object';
+    const result = runCode(mockData);
+    assertThat(result.restricted).isTrue();
+    assertThat(result.vendor.tiktok.limited_data_use).isTrue();
+- name: '[Region] All US scope skips non US traffic'
+  code: |-
+    setRequest({
+      headers: { 'sec-gpc': '1' },
+      eventData: { event_location: { country: 'BR', region: 'SP' } }
+    });
+
+    const result = runCode(createMockData({}));
+
+    assertThat(result.decision).isEqualTo('allow');
+    assertThat(result.opted_out).isTrue();
+    assertThat(result.applies).isFalse();
+    assertThat(result.reason).isEqualTo('region_not_applicable');
+    assertThat(result.country).isEqualTo('BR');
+    assertThat(result.region).isEqualTo('SP');
+    assertThat(result.vendor.meta.data_processing_options).isEqualTo([]);
+
+    const everywhere = runCode(createMockData({ regionScope: 'everywhere' }));
+    assertThat(everywhere.decision).isEqualTo('limited');
+    assertThat(everywhere.applies).isTrue();
+- name: '[Region] Selected states and unknown location behavior'
+  code: |-
+    [
+      { location: { country: 'US', region: 'CA' }, scope: 'states', expected: true },
+      { location: { country: 'US', region: 'NY' }, scope: 'states', expected: false },
+      { location: { country: 'US', region: 'NY' }, scope: 'states', states: 'ny, nj', expected: true },
+      { location: { country: 'US' }, scope: 'states', expected: true },
+      { location: { country: 'US' }, scope: 'states', unknown: 'skip', expected: false },
+      { location: undefined, scope: 'us', expected: true },
+      { location: undefined, scope: 'us', unknown: 'skip', expected: false },
+      { location: { country: 'CA', region: 'QC' }, scope: 'states', expected: false }
+    ].forEach((scenario) => {
+      setRequest({ headers: { 'sec-gpc': '1' }, eventData: { event_location: scenario.location } });
+
+      const overrides = { regionScope: scenario.scope, unknownGeoBehavior: scenario.unknown || 'apply' };
+      if (scenario.states) overrides.regionStates = scenario.states;
+      const result = runCode(createMockData(overrides));
+
+      assertThat(result.applies).isEqualTo(scenario.expected);
+      assertThat(result.decision).isEqualTo(scenario.expected ? 'limited' : 'allow');
+    });
+- name: '[Geo] Reads event_location, then geo headers, and normalizes values'
+  code: |-
+    [
+      {
+        request: { eventData: { event_location: { country: 'us', region: 'ca' } }, headers: { 'x-geo-country': 'BR' } },
+        expected: { country: 'US', region: 'CA', source: 'event_location' }
+      },
+      {
+        request: { eventData: { event_location: { country: 'US' } } },
+        expected: { country: 'US', region: undefined, source: 'event_location' }
+      },
+      {
+        request: { eventData: { event_location: { country: 'XX' } }, headers: { 'x-geo-country': 'US', 'x-geo-region': 'California' } },
+        expected: { country: 'US', region: 'CA', source: 'x-geo' }
+      },
+      {
+        request: { eventData: {}, headers: { 'x-geo-country': 'US', 'x-geo-region': 'New York' } },
+        expected: { country: 'US', region: 'NY', source: 'x-geo' }
+      },
+      {
+        request: { eventData: {}, headers: { 'x-geo-country': 'ZZ', 'x-gclb-country': 'US', 'x-gclb-region': 'USTX' } },
+        expected: { country: 'US', region: 'TX', source: 'x-gclb' }
+      },
+      {
+        request: { eventData: {}, headers: { 'x-geo-country': 'DE', 'x-geo-region': 'Bavaria' } },
+        expected: { country: 'DE', region: 'BAVARIA', source: 'x-geo' }
+      },
+      {
+        request: { eventData: {}, headers: { 'cf-ipcountry': 'US' } },
+        expected: { country: 'US', region: undefined, source: 'cf' }
+      },
+      {
+        request: { eventData: {}, headers: { 'cf-ipcountry': 'USA' } },
+        expected: { country: undefined, region: undefined, source: 'none' }
+      }
+    ].forEach((scenario) => {
+      setRequest(scenario.request);
+
+      const result = runCode(createMockData({}));
+
+      assertThat(result.country).isEqualTo(scenario.expected.country);
+      assertThat(result.region).isEqualTo(scenario.expected.region);
+      assertThat(result.geo_source).isEqualTo(scenario.expected.source);
+    });
+- name: '[Geo] Custom variables override automatic detection'
+  code: |-
+    setRequest({ eventData: { event_location: { country: 'BR', region: 'SP' } } });
+
+    [
+      { country: 'us', region: 'US-TX', expected: { country: 'US', region: 'TX' } },
+      { country: 'US', region: 'texas', expected: { country: 'US', region: 'TX' } },
+      { country: '', region: 'CA', expected: { country: undefined, region: 'CA' } }
+    ].forEach((scenario) => {
+      const result = runCode(
+        createMockData({ geoSource: 'custom', customCountry: scenario.country, customRegion: scenario.region })
+      );
+
+      assertThat(result.country).isEqualTo(scenario.expected.country);
+      assertThat(result.region).isEqualTo(scenario.expected.region);
+      assertThat(result.geo_source).isEqualTo('custom');
+    });
+- name: '[Return Types] Each return type returns the matching value'
+  code: |-
+    [
+      { gpc: '1', returnType: 'decision', expected: 'limited' },
+      { gpc: undefined, returnType: 'decision', expected: 'allow' },
+      { gpc: '1', returnType: 'restricted', expected: true },
+      { gpc: undefined, returnType: 'restricted', expected: false },
+      { gpc: '1', returnType: 'metaDpo', expected: ['LDU'] },
+      { gpc: undefined, returnType: 'metaDpo', expected: [] },
+      { gpc: '1', returnType: 'metaDpoCountry', expected: 0 },
+      { gpc: undefined, returnType: 'metaDpoCountry', expected: undefined },
+      { gpc: '1', returnType: 'metaDpoState', expected: 0 },
+      { gpc: undefined, returnType: 'metaDpoState', expected: undefined },
+      { gpc: '1', returnType: 'googleAdsRdp', expected: true },
+      { gpc: undefined, returnType: 'googleAdsRdp', expected: false },
+      { gpc: '1', returnType: 'tiktokLdu', expected: true },
+      { gpc: undefined, returnType: 'tiktokLdu', expected: false }
+    ].forEach((scenario) => {
+      setRequest({ headers: { 'sec-gpc': scenario.gpc } });
+
+      assertThat(runCode(createMockData({ returnType: scenario.returnType }))).isEqualTo(scenario.expected);
+    });
+- name: '[Meta] United States mode sets country 1 and state 1000 only for California'
+  code: |-
+    [
+      { region: 'CA', state: 1000 },
+      { region: 'CO', state: 0 },
+      { region: undefined, state: 0 }
+    ].forEach((scenario) => {
+      setRequest({ headers: { 'sec-gpc': '1' }, eventData: { event_location: { country: 'US', region: scenario.region } } });
+
+      const meta = runCode(createMockData({ metaDpoMode: 'us' })).vendor.meta;
+
+      assertThat(meta.data_processing_options).isEqualTo(['LDU']);
+      assertThat(meta.data_processing_options_country).isEqualTo(1);
+      assertThat(meta.data_processing_options_state).isEqualTo(scenario.state);
+    });
