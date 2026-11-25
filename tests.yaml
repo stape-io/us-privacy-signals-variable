@@ -1,0 +1,474 @@
+setup: |-
+  const Object = require('Object');
+
+  const fx = {
+    natSale: 'DBABL~BEAaAAAAAAA',
+    natNo: 'DBABL~BAAqAAAAAAA',
+    natTargeted: 'DBABL~CAApAAAAAAA',
+    natGpc: 'DBABL~BAAqAAAAAAA.Y',
+    natGpcFalse: 'DBABL~BAAqAAAAAAA.Q',
+    natNa: 'DBABL~BAAAAAAAAAA',
+    natV3: 'DBABL~DAAQAAAAAAA',
+    multi: 'DBADMNg~CPXxRfAPXxRfAAfKABENB-CgAAAAAAAAAAYgAAAAAAAA~BAAqAAAAAAA~BAYAAAAA',
+    ranges: 'DBABrY~BAAqAAAAAAA~BAoAAAAA~BAYAAAA',
+    iabNatGpc: 'DBABLA~CEAqAAAAAABA.YA',
+    iabCaSale: 'DBABBg~BAYAAABA.QA',
+    iabMultiNo: 'DBACzzA~1YNN~CAAqAAAAAABA.QA~BAoAABA'
+  };
+
+  const gcd = {
+    none: '13l3l3l3l1l1',
+    granted: '13t3t3t3t500',
+    denied: '13p3p3p3p500',
+    adPersDenied: '13t3t3t1u500',
+    userDataDenied: '13t3t1p3t500',
+    grantedUpdate: '11r1r1r1r500',
+    delegated: '11p3tNl3t500',
+    delegatedToAnalytics: '11t1pRl1t500',
+    cycle: '1Vl1tNl1t500',
+    gpc: '13t3t3t3td00',
+    gpcOnly: '13l3l3l3l900'
+  };
+
+  const assign = (target, source) => {
+    Object.keys(source || {}).forEach((key) => {
+      target[key] = source[key];
+    });
+    return target;
+  };
+
+  const createMockData = (overrides) => {
+    return assign(
+      {
+        returnType: 'object',
+        optOutAction: 'limited',
+        resolutionMode: 'anyOptOut',
+        noSignalBehavior: 'allow',
+        enableGpc: true,
+        enableGpp: true,
+        enableUsPrivacy: true,
+        enableCmp: false,
+        enableConsentMode: false,
+        consentModeReports: 'optOutOnly',
+        regionScope: 'us',
+        regionStates: 'CA,CO,CT,DE,FL,IA,IN,KY,MD,MN,MT,NE,NH,NJ,OR,RI,TN,TX,UT,VA',
+        unknownGeoBehavior: 'apply',
+        geoSource: 'auto',
+        metaDpoMode: 'geolocation'
+      },
+      overrides
+    );
+  };
+
+  const usEventData = (extra) => {
+    return assign({ event_name: 'page_view', event_location: { country: 'US', region: 'CA' } }, extra);
+  };
+
+  const setRequest = (request) => {
+    const eventData = request.eventData === undefined ? usEventData({}) : request.eventData;
+    const headers = request.headers || {};
+    const cookies = request.cookies || {};
+    mock('getAllEventData', () => eventData);
+    mock('getRequestHeader', (name) => headers[name.toLowerCase()]);
+    mock('getCookieValues', (name) => (cookies[name] === undefined ? [] : [cookies[name]]));
+  };
+
+  const run = (request, overrides) => {
+    setRequest(request || {});
+    return runCode(createMockData(overrides || {}));
+  };
+  const ev = (extra) => ({ eventData: usEventData(extra) });
+  const gpp = (value, sid) => ev({ 'x-sst-system_properties': { gpp: value, gpp_sid: sid } });
+  const gpcHeader = { headers: { 'sec-gpc': '1' } };
+  const at = (country, region) => ({ headers: { 'sec-gpc': '1' }, eventData: { event_location: { country: country, region: region } } });
+
+  setRequest({});
+scenarios:
+- name: '[Default] No signal returns allow, and GPC returns limited with vendor flags'
+  code: |-
+    assertThat(run({}, { returnType: undefined })).isEqualTo('allow');
+
+    let result = run({});
+    assertThat([result.decision, result.restricted, result.opted_out, result.reason, result.applies]).isEqualTo(['allow', false, false, 'no_opt_out_signal', true]);
+    assertThat(result.signals).isEqualTo({ gpc: 'unknown', gpp: 'unknown', us_privacy: 'unknown', cmp: 'disabled', consent_mode: 'disabled' });
+    assertThat(result.vendor).isEqualTo({
+      meta: { data_processing_options: [], data_processing_options_country: undefined, data_processing_options_state: undefined },
+      google_ads: { restricted_data_processing: false },
+      tiktok: { limited_data_use: false }
+    });
+
+    result = run(gpcHeader);
+    assertThat([result.decision, result.restricted, result.opted_out, result.reason]).isEqualTo(['limited', true, true, 'gpc']);
+    assertThat(result.details.gpc).isEqualTo({ status: 'opt_out', value: '1', source: 'sec-gpc' });
+    assertThat(result.vendor).isEqualTo({
+      meta: { data_processing_options: ['LDU'], data_processing_options_country: 0, data_processing_options_state: 0 },
+      google_ads: { restricted_data_processing: true },
+      tiktok: { limited_data_use: true }
+    });
+- name: '[GPC] Reads Sec-GPC, falls back to the GPC flag in x-ga-gcd'
+  code: |-
+    [['1, 1', 'opt_out'], [' 1 ', 'opt_out'], ['0', 'unknown'], ['true', 'unknown'], ['', 'unknown'], [undefined, 'unknown']].forEach((c) => {
+      assertThat(run({ headers: { 'sec-gpc': c[0] } }).signals.gpc).isEqualTo(c[1]);
+    });
+    assertThat(run(gpcHeader, { enableGpc: false }).signals.gpc).isEqualTo('disabled');
+
+    [
+      [{}, gcd.gpcOnly, 'opt_out', 'x-ga-gcd'],
+      [{}, gcd.gpc, 'opt_out', 'x-ga-gcd'],
+      [{ 'sec-gpc': '1' }, gcd.gpc, 'opt_out', 'sec-gpc'],
+      [{ 'sec-gpc': '0' }, gcd.gpc, 'opt_out', 'x-ga-gcd'],
+      [{}, gcd.none, 'unknown', undefined],
+      [{}, '1!!!!!!!!!!!', 'unknown', undefined]
+    ].forEach((c) => {
+      const result = run({ headers: c[0], eventData: usEventData({ 'x-ga-gcd': c[1] }) });
+      assertThat([result.signals.gpc, result.details.gpc.source]).isEqualTo([c[2], c[3]]);
+    });
+- name: '[GPP] Decodes US National versions 1 and 2 with the GPC sub-section'
+  code: |-
+    [
+      [fx.natSale, 'opt_out', 1, [1, 2, 2], undefined],
+      [fx.natNo, 'no_opt_out', 1, [2, 2, 2], undefined],
+      [fx.natTargeted, 'opt_out', 2, [2, 2, 1], undefined],
+      [fx.natGpc, 'opt_out', 1, [2, 2, 2], true],
+      [fx.natGpcFalse, 'no_opt_out', 1, [2, 2, 2], false],
+      [fx.natNa, 'unknown', 1, [0, 0, 0], undefined],
+      [fx.iabNatGpc, 'opt_out', 2, [2, 2, 2], true]
+    ].forEach((c) => {
+      const result = run(gpp(c[0], '7'));
+      const s = result.details.gpp.sections[0];
+      assertThat(result.signals.gpp).isEqualTo(c[1]);
+      assertThat(result.details.gpp.applicable_sections).isEqualTo([7]);
+      assertThat([s.id, s.name, s.version, s.sale_opt_out, s.sharing_opt_out, s.targeted_advertising_opt_out, s.gpc]).isEqualTo([7, 'usnat', c[2], c[3][0], c[3][1], c[3][2], c[4]]);
+    });
+- name: '[GPP] Decodes the state sections 8 to 27 (official IAB encoder strings)'
+  code: |-
+    [
+      ['DBABBg~BAkAAAAA', 8, 'usca', 'sharing_opt_out', 1, 'opt_out'],
+      [fx.iabCaSale, 8, 'usca', 'sale_opt_out', 1, 'opt_out'],
+      ['DBABRg~BAYAAAA', 9, 'usva', 'sale_opt_out', 1, 'opt_out'],
+      ['DBABJg~BAkAAAA', 10, 'usco', 'targeted_advertising_opt_out', 1, 'opt_out'],
+      ['DBABFg~BAGAAAA', 11, 'usut', 'sale_opt_out', 1, 'opt_out'],
+      ['DBABVg~BAoAAAA', 12, 'usct', 'sale_opt_out', 2, 'no_opt_out'],
+      ['DBABAw~BAYAAABA', 13, 'usfl', 'sale_opt_out', 1, 'opt_out'],
+      ['DBABQw~BAkAAABA.QA', 14, 'usmt', 'targeted_advertising_opt_out', 1, 'opt_out'],
+      ['DBABIw~BAYAAAABAA.QA', 15, 'usor', 'sale_opt_out', 1, 'opt_out'],
+      ['DBABEw~BAkAAAQA.QA', 16, 'ustx', 'targeted_advertising_opt_out', 1, 'opt_out'],
+      ['DBABEw~BAoAAAQA.YA', 16, 'ustx', 'gpc', true, 'opt_out'],
+      ['DBABUw~BAYAAAABAA.QA', 17, 'usde', 'sale_opt_out', 1, 'opt_out'],
+      ['DBABCw~BAJAAAQA.QA', 18, 'usia', 'targeted_advertising_opt_out', 1, 'opt_out'],
+      ['DBABSw~BAYAAAQA.QA', 19, 'usne', 'sale_opt_out', 1, 'opt_out'],
+      ['DBABKw~BAkAAABA.QA', 20, 'usnh', 'targeted_advertising_opt_out', 1, 'opt_out'],
+      ['DBABAYA~BAYAAAAAQA.QA', 21, 'usnj', 'sale_opt_out', 1, 'opt_out'],
+      ['DBABQYA~BAkAAAQA.QA', 22, 'ustn', 'targeted_advertising_opt_out', 1, 'opt_out'],
+      ['DBABIYA~BAYAAAQA.QA', 23, 'usmn', 'sale_opt_out', 1, 'opt_out'],
+      ['DBABEYA~BQCQ.QA', 24, 'usmd', 'targeted_advertising_opt_out', 1, 'opt_out'],
+      ['DBABEYA~BQCg.QA', 24, 'usmd', 'gpc', false, 'no_opt_out'],
+      ['DBABUYA~BQBg.AAA', 25, 'usin', 'sale_opt_out', 1, 'opt_out'],
+      ['DBABCYA~BQCQ.AAA', 26, 'usky', 'targeted_advertising_opt_out', 1, 'opt_out'],
+      ['DBABSYA~BQBg.AAA', 27, 'usri', 'sale_opt_out', 1, 'opt_out']
+    ].forEach((c) => {
+      const result = run(gpp(c[0]));
+      const s = result.details.gpp.sections[0];
+      assertThat([s.id, s.name, s.version, s[c[3]], result.signals.gpp]).isEqualTo([c[1], c[2], 1, c[4], c[5]]);
+    });
+- name: '[GPP] Multi-section strings, range headers, uspv1 and applicable section IDs'
+  code: |-
+    let result = run(gpp(fx.multi));
+    assertThat(result.signals.gpp).isEqualTo('opt_out');
+    assertThat(result.details.gpp.sections.map((s) => [s.id, s.status, s.supported])).isEqualTo([[2, 'unknown', false], [7, 'no_opt_out', undefined], [8, 'opt_out', undefined]]);
+    assertThat(run(gpp(fx.ranges)).details.gpp.sections.map((s) => s.name)).isEqualTo(['usnat', 'usca', 'usva']);
+    assertThat(run(gpp(fx.iabMultiNo)).details.gpp.sections.map((s) => s.name)).isEqualTo(['uspv1', 'usnat', 'usva']);
+    assertThat(run(gpp(fx.iabMultiNo)).signals.gpp).isEqualTo('no_opt_out');
+    assertThat(run(gpp('DBABT~1YYN')).details.gpp.sections[0]).isEqualTo({ id: 6, name: 'uspv1', value: '1YYN', status: 'opt_out' });
+
+    [
+      ['7', 'no_opt_out', [7]],
+      ['8', 'opt_out', [8]],
+      ['2_7', 'no_opt_out', [2, 7]],
+      ['7,8', 'opt_out', [7, 8]],
+      [[7], 'no_opt_out', [7]],
+      ['-1', 'unknown', []],
+      [undefined, 'opt_out', undefined]
+    ].forEach((c) => {
+      result = run(gpp(fx.multi, c[0]));
+      assertThat([result.signals.gpp, result.details.gpp.applicable_sections]).isEqualTo([c[1], c[2]]);
+    });
+- name: '[GPP] Source order, and invalid, unsupported or v3 strings are unknown'
+  code: |-
+    let result = run({ eventData: usEventData({ 'x-ads-gpp': fx.natSale, 'x-ads-gpp_sid': '7' }), cookies: { OTGPPConsent: fx.natNo } });
+    assertThat([result.signals.gpp, result.details.gpp.source, result.details.gpp.applicable_sections]).isEqualTo(['opt_out', 'x-ads-gpp', [7]]);
+    result = run({ cookies: { OTGPPConsent: fx.iabCaSale } });
+    assertThat([result.signals.gpp, result.details.gpp.source, result.details.gpp.applicable_sections]).isEqualTo(['opt_out', 'cookie_OTGPPConsent', undefined]);
+    assertThat(run(ev({ 'x-sst-system_properties.gpp': fx.natSale })).signals.gpp).isEqualTo('opt_out');
+    assertThat(run(ev({ 'x-sst-system_properties': { gpp: fx.natNo }, 'x-ads-gpp': fx.natSale })).signals.gpp).isEqualTo('no_opt_out');
+    result = run({}, { gppString: fx.natSale, gppSid: '8' });
+    assertThat([result.details.gpp.value, result.signals.gpp]).isEqualTo([fx.natSale, 'unknown']);
+
+    [
+      ['not a gpp string!', 'invalid_gpp_string'],
+      ['BBABM~1YYN', 'invalid_gpp_string'],
+      ['DBAB', 'invalid_gpp_string'],
+      ['DBABrlFEFUJCw~BAAqAAAAAAA', 'invalid_gpp_string'],
+      ['DBABL', undefined, []],
+      [fx.natV3, undefined, [[7, false]]],
+      ['DBABKY~BAAAAAA', undefined, [[28, false]]]
+    ].forEach((c) => {
+      result = run(gpp(c[0]));
+      assertThat([result.signals.gpp, result.details.gpp.error]).isEqualTo(['unknown', c[1]]);
+      if (c[2]) assertThat(result.details.gpp.sections.map((s) => [s.id, s.supported])).isEqualTo(c[2]);
+    });
+    result = run(gpp('DBABL~BAA'));
+    assertThat([result.signals.gpp, result.details.gpp.sections[0].version, result.details.gpp.sections[0].sale_opt_out]).isEqualTo(['unknown', 1, undefined]);
+- name: '[US Privacy] Parses the opt-out character and reads sources in order'
+  code: |-
+    [['1YYN', 'opt_out'], ['1nyn', 'opt_out'], ['1YNN', 'no_opt_out'], ['1---', 'unknown'], ['2YYN', 'unknown'], ['1YY', 'unknown']].forEach((c) => {
+      const result = run(ev({ 'x-sst-system_properties': { us_privacy: c[0] } }));
+      assertThat([result.signals.us_privacy, result.details.us_privacy.value]).isEqualTo([c[1], c[0]]);
+    });
+
+    const both = { 'x-sst-system_properties': { us_privacy: '1YNN' }, 'x-ads-us_privacy': '1YYN' };
+    [
+      [{ eventData: usEventData(both), cookies: { usprivacy: '1YYN' } }, { usPrivacyString: '1YYY' }, 'variable'],
+      [ev(both), {}, 'x-sst-system_properties.us_privacy'],
+      [{ eventData: usEventData({ 'x-ads-us_privacy': '1YYN' }), cookies: { usprivacy: '1YNN' } }, {}, 'x-ads-us_privacy'],
+      [{ cookies: { usprivacy: '1YYN', us_privacy: '1YNN' } }, {}, 'cookie_usprivacy'],
+      [{ cookies: { us_privacy: '1YYN' } }, {}, 'cookie_us_privacy']
+    ].forEach((c) => {
+      assertThat(run(c[0], c[1]).details.us_privacy.source).isEqualTo(c[2]);
+    });
+    assertThat(run({}, { enableUsPrivacy: false, usPrivacyString: '1YYN' }).signals.us_privacy).isEqualTo('disabled');
+- name: '[CMP] OneTrust and Cookiebot presets'
+  code: |-
+    [
+      ['isGpcEnabled=0&datestamp=x&groups=C0001%3A1%2CC0002%3A1%2CC0004%3A0', undefined, 'opt_out', false],
+      ['isGpcEnabled=0&groups=C0001:1,C0004:1&geolocation=US;CA', undefined, 'no_opt_out', false],
+      ['groups=C0001:1,C0002:0', undefined, 'unknown', false],
+      ['datestamp=x', undefined, 'unknown', false],
+      ['groups=C0001:1,C0005:0', 'C0005', 'opt_out', false],
+      ['isGpcEnabled=1&browserGpcFlag=1&groups=C0001%3A1%2CC0004%3A1', undefined, 'opt_out', true],
+      ['browserGpcFlag=1&datestamp=x', undefined, 'opt_out', true],
+      ['isGpcEnabled=1&browserGpcFlag=0&groups=C0004:1', undefined, 'no_opt_out', false],
+      [undefined, undefined, 'unknown', undefined]
+    ].forEach((c) => {
+      const result = run({ cookies: { OptanonConsent: c[0] } }, { enableCmp: true, cmpPreset: 'onetrust', oneTrustCategory: c[1] });
+      assertThat([result.signals.cmp, result.details.cmp.cookie_found, result.details.cmp.browser_gpc]).isEqualTo([c[2], c[0] !== undefined, c[3]]);
+    });
+
+    [
+      ["{stamp:'abc',necessary:true,preferences:true,statistics:true,marketing:false,method:'explicit',ver:1}", 'opt_out'],
+      ['{stamp:%27abc%27%2Cnecessary:true%2Cmarketing:true}', 'no_opt_out'],
+      ['{"necessary": true, "marketing": false}', 'opt_out'],
+      ['-1', 'unknown'],
+      [undefined, 'unknown']
+    ].forEach((c) => {
+      const result = run({ cookies: { CookieConsent: c[0] } }, { enableCmp: true, cmpPreset: 'cookiebot' });
+      assertThat([result.signals.cmp, result.details.cmp.preset]).isEqualTo([c[1], 'cookiebot']);
+    });
+- name: '[CMP] TrustArc and custom cookie presets'
+  code: |-
+    [
+      [{ notice_gdpr_prefs: '0,1:', notice_preferences: '2:' }, undefined, 'opt_out', 'notice_gdpr_prefs'],
+      [{ notice_gdpr_prefs: '0,1,2:' }, undefined, 'no_opt_out', 'notice_gdpr_prefs'],
+      [{ notice_gdpr_prefs: '0,1,12:' }, undefined, 'opt_out', 'notice_gdpr_prefs'],
+      [{ notice_gdpr_prefs: '100:' }, undefined, 'unknown', 'notice_gdpr_prefs'],
+      [{ notice_gdpr_prefs: 'abc:' }, undefined, 'unknown', 'notice_gdpr_prefs'],
+      [{ notice_preferences: '1:' }, undefined, 'opt_out', 'notice_preferences'],
+      [{ notice_preferences: '2:' }, undefined, 'no_opt_out', 'notice_preferences'],
+      [{ notice_preferences: '3:' }, undefined, 'no_opt_out', 'notice_preferences'],
+      [{ notice_preferences: 'abc:' }, undefined, 'unknown', 'notice_preferences'],
+      [{ notice_preferences: '100:' }, undefined, 'unknown', 'notice_preferences'],
+      [{ notice_preferences: '1:' }, '1', 'no_opt_out', 'notice_preferences'],
+      [{}, undefined, 'unknown', undefined]
+    ].forEach((c) => {
+      const result = run({ cookies: c[0] }, { enableCmp: true, cmpPreset: 'trustarc', trustArcCategory: c[1] });
+      assertThat([result.signals.cmp, result.details.cmp.cookie]).isEqualTo([c[2], c[3]]);
+    });
+
+    [
+      ['equals', 'optout', 'optout', 'optin', 'opt_out'],
+      ['equals', 'optin', 'optout', 'optin', 'no_opt_out'],
+      ['equals', 'other', 'optout', 'optin', 'unknown'],
+      ['contains', 'sale=0|share=0', 'sale=0', undefined, 'opt_out'],
+      ['regex', 'Marketing=DENIED', 'marketing=(denied|0)', undefined, 'opt_out'],
+      ['regex', 'marketing=granted', 'marketing=(denied|0)', 'granted$', 'no_opt_out'],
+      ['equals', undefined, 'optout', undefined, 'unknown']
+    ].forEach((c) => {
+      const result = run({ cookies: { my_consent: c[1] } }, {
+        enableCmp: true,
+        cmpPreset: 'custom',
+        cmpCustomCookieName: 'my_consent',
+        cmpCustomMatchType: c[0],
+        cmpCustomOptOutValue: c[2],
+        cmpCustomOptInValue: c[3]
+      });
+      assertThat([result.signals.cmp, result.details.cmp.cookie_found]).isEqualTo([c[4], c[1] !== undefined]);
+    });
+    assertThat(run({}, { enableCmp: true, cmpPreset: 'custom' }).details.cmp).isEqualTo({ status: 'unknown', preset: 'custom', cookie_found: false });
+- name: '[Google Consent Mode] Reads consent_state, x-ga-gcd, x-ga-gcs, npa and rdp'
+  code: |-
+    [
+      [{ consent_state: { ad_storage: false, ad_user_data: true } }, 'opt_out', 'consent_state'],
+      [{ consent_state: { ad_storage: true, ad_user_data: false } }, 'opt_out', 'consent_state'],
+      [{ consent_state: { ad_storage: true, ad_personalization: false } }, 'opt_out', 'consent_state'],
+      [{ consent_state: { ad_storage: true }, 'x-ga-gcd': gcd.denied }, 'no_opt_out', 'consent_state'],
+      [{ consent_state: { analytics_storage: true }, 'x-ga-gcd': gcd.denied }, 'opt_out', 'x-ga-gcd'],
+      [{ 'x-ga-gcd': gcd.granted, 'x-ga-gcs': 'G100' }, 'no_opt_out', 'x-ga-gcd'],
+      [{ 'x-ga-gcd': gcd.denied }, 'opt_out', 'x-ga-gcd'],
+      [{ 'x-ga-gcd': gcd.adPersDenied }, 'opt_out', 'x-ga-gcd'],
+      [{ 'x-ga-gcd': gcd.userDataDenied }, 'opt_out', 'x-ga-gcd'],
+      [{ 'x-ga-gcd': gcd.grantedUpdate }, 'no_opt_out', 'x-ga-gcd'],
+      [{ 'x-ga-gcd': gcd.delegated }, 'opt_out', 'x-ga-gcd'],
+      [{ 'x-ga-gcd': gcd.delegatedToAnalytics }, 'opt_out', 'x-ga-gcd'],
+      [{ 'x-ga-gcd': gcd.cycle }, 'unknown', undefined],
+      [{ 'x-ga-gcd': gcd.none, 'x-ga-gcs': 'G100' }, 'opt_out', 'x-ga-gcs'],
+      [{ 'x-ga-gcd': 'not a gcd', 'x-ga-gcs': 'G111' }, 'no_opt_out', 'x-ga-gcs'],
+      [{ 'x-ga-gcd': '13p3p', 'x-ga-gcs': 'G111' }, 'no_opt_out', 'x-ga-gcs'],
+      [{ 'x-ga-gcs': 'G100' }, 'opt_out', 'x-ga-gcs'],
+      [{ 'x-ga-gcs': 'G1--' }, 'unknown', undefined],
+      [{ 'x-ga-gcs': 'G111', 'x-ga-npa': '1' }, 'no_opt_out', 'x-ga-gcs'],
+      [{ 'x-ga-gcs': 'G111', 'x-ga-npa': '1' }, 'opt_out', 'x-ga-npa', true],
+      [{ 'x-ga-npa': '0' }, 'unknown', undefined, true],
+      [{ 'x-sst-system_properties': { rdp: true } }, 'opt_out', 'x-sst-system_properties.rdp', false, true],
+      [{ 'x-sst-system_properties': { rdp: false } }, 'unknown', undefined, false, true]
+    ].forEach((c) => {
+      const result = run(ev(c[0]), { enableConsentMode: true, consentModeReports: 'all', consentModeUseNpa: c[3], consentModeUseRdp: c[4] });
+      assertThat([result.signals.consent_mode, result.details.consent_mode.source]).isEqualTo([c[1], c[2]]);
+    });
+
+    assertThat(run(ev({ 'x-ga-gcd': gcd.adPersDenied }), { enableConsentMode: true }).details.consent_mode).isEqualTo({
+      status: 'opt_out',
+      source: 'x-ga-gcd',
+      states: { ad_storage: 'granted', ad_user_data: 'granted', ad_personalization: 'denied' },
+      value: gcd.adPersDenied
+    });
+    [
+      [gcd.delegated, { ad_storage: 'denied', ad_user_data: 'denied', ad_personalization: 'granted' }],
+      [gcd.delegatedToAnalytics, { ad_storage: 'granted', ad_user_data: 'denied', ad_personalization: 'granted' }],
+      [gcd.cycle, undefined]
+    ].forEach((c) => {
+      assertThat(run(ev({ 'x-ga-gcd': c[0] }), { enableConsentMode: true, consentModeReports: 'all' }).details.consent_mode.states).isEqualTo(c[1]);
+    });
+- name: '[Google Consent Mode] Opt-out only reports granted as unknown'
+  code: |-
+    [
+      [{ consent_state: { ad_storage: true } }, 'optOutOnly', 'unknown', true],
+      [{ 'x-ga-gcd': gcd.granted }, 'optOutOnly', 'unknown', true],
+      [{ 'x-ga-gcs': 'G111' }, undefined, 'unknown', true],
+      [{ 'x-ga-gcd': gcd.denied }, 'optOutOnly', 'opt_out', undefined],
+      [{ 'x-ga-gcd': gcd.granted }, 'all', 'no_opt_out', undefined]
+    ].forEach((c) => {
+      const result = run(ev(c[0]), { enableConsentMode: true, consentModeReports: c[1] });
+      assertThat([result.signals.consent_mode, result.details.consent_mode.granted_reported_as_unknown]).isEqualTo([c[2], c[3]]);
+    });
+
+    [['optOutOnly', 'limited', 'no_clear_signal'], ['all', 'allow', 'no_opt_out_signal']].forEach((c) => {
+      const result = run(ev({ 'x-ga-gcd': gcd.granted }), { enableConsentMode: true, consentModeReports: c[0], noSignalBehavior: 'optOut' });
+      assertThat([result.decision, result.reason]).isEqualTo([c[1], c[2]]);
+    });
+- name: '[Resolution] Any opt-out wins, priority mode, priority table and fail closed'
+  code: |-
+    const otOut = { headers: { 'sec-gpc': '1' }, cookies: { OptanonConsent: 'groups=C0004:0' }, eventData: usEventData({ 'x-sst-system_properties': { us_privacy: '1YNN' } }) };
+    const ot = { enableCmp: true, cmpPreset: 'onetrust' };
+    assertThat(run(otOut, ot).reason).isEqualTo('gpc');
+    assertThat(run(otOut, assign({ signalPriority: [{ signal: 'us_privacy' }, { signal: 'cmp' }, { signal: 'gpc' }] }, ot)).reason).isEqualTo('cmp');
+
+    const otIn = { headers: { 'sec-gpc': '1' }, cookies: { OptanonConsent: 'groups=C0004:1' } };
+    let result = run(otIn, assign({ resolutionMode: 'priority', signalPriority: [{ signal: 'cmp' }, { signal: 'gpc' }] }, ot));
+    assertThat([result.decision, result.opted_out, result.reason]).isEqualTo(['allow', false, 'cmp']);
+    assertThat(run(otIn, assign({ resolutionMode: 'priority' }, ot)).reason).isEqualTo('gpc');
+    result = run({ cookies: { OptanonConsent: 'groups=C0002:1' } }, assign({ resolutionMode: 'priority' }, ot));
+    assertThat([result.decision, result.reason]).isEqualTo(['allow', 'no_opt_out_signal']);
+
+    const uspOut = { headers: { 'sec-gpc': '1' }, eventData: usEventData({ 'x-sst-system_properties': { us_privacy: '1YYN' } }) };
+    assertThat(run(uspOut, { signalPriority: [{ signal: 'bogus' }, {}, { signal: 'us_privacy' }, { signal: 'us_privacy' }] }).reason).isEqualTo('us_privacy');
+    assertThat(run(uspOut, { signalPriority: 'not a table' }).reason).isEqualTo('gpc');
+
+    const failClosed = { noSignalBehavior: 'optOut' };
+    [
+      [{}, {}, 'allow', 'no_opt_out_signal', false],
+      [{}, failClosed, 'limited', 'no_clear_signal', true],
+      [gpp('garbage!'), { noSignalBehavior: 'optOut', optOutAction: 'block' }, 'block', 'no_clear_signal', true],
+      [ev({ 'x-sst-system_properties': { us_privacy: '1YNN' } }), failClosed, 'allow', 'no_opt_out_signal', false],
+      [{ cookies: { OptanonConsent: 'groups=C0004:1' } }, assign({ noSignalBehavior: 'optOut', resolutionMode: 'priority' }, ot), 'allow', 'cmp', false],
+      [gpcHeader, failClosed, 'limited', 'gpc', true],
+      [{ eventData: { event_location: { country: 'BR', region: 'SP' } } }, failClosed, 'allow', 'region_not_applicable', true]
+    ].forEach((c) => {
+      result = run(c[0], c[1]);
+      assertThat([result.decision, result.reason, result.opted_out]).isEqualTo([c[2], c[3], c[4]]);
+    });
+- name: '[Region] Scope, selected states and unknown location'
+  code: |-
+    let result = run(at('BR', 'SP'));
+    assertThat([result.decision, result.opted_out, result.applies, result.reason, result.country, result.region]).isEqualTo(['allow', true, false, 'region_not_applicable', 'BR', 'SP']);
+    assertThat(result.vendor.meta.data_processing_options).isEqualTo([]);
+    result = run(at('BR', 'SP'), { regionScope: 'everywhere' });
+    assertThat([result.decision, result.applies]).isEqualTo(['limited', true]);
+
+    [
+      [{ country: 'US', region: 'CA' }, 'states', undefined, 'apply', true],
+      [{ country: 'US', region: 'NY' }, 'states', undefined, 'apply', false],
+      [{ country: 'US', region: 'NY' }, 'states', 'ny, nj', 'apply', true],
+      [{ country: 'US' }, 'states', undefined, 'apply', true],
+      [{ country: 'US' }, 'states', undefined, 'skip', false],
+      [undefined, 'us', undefined, 'apply', true],
+      [undefined, 'us', undefined, 'skip', false],
+      [{ country: 'CA', region: 'QC' }, 'states', undefined, 'apply', false]
+    ].forEach((c) => {
+      const overrides = { regionScope: c[1], unknownGeoBehavior: c[3] };
+      if (c[2]) overrides.regionStates = c[2];
+      result = run({ headers: { 'sec-gpc': '1' }, eventData: { event_location: c[0] } }, overrides);
+      assertThat([result.applies, result.decision]).isEqualTo([c[4], c[4] ? 'limited' : 'allow']);
+    });
+- name: '[Geo] Reads event_location, then geo headers, custom variables, and normalizes values'
+  code: |-
+    [
+      [{ event_location: { country: 'us', region: 'ca' } }, { 'x-geo-country': 'BR' }, ['US', 'CA', 'event_location']],
+      [{ event_location: { country: 'US' } }, {}, ['US', undefined, 'event_location']],
+      [{ event_location: { country: 'XX' } }, { 'x-geo-country': 'US', 'x-geo-region': 'California' }, ['US', 'CA', 'x-geo']],
+      [{}, { 'x-geo-country': 'US', 'x-geo-region': 'New York' }, ['US', 'NY', 'x-geo']],
+      [{}, { 'x-geo-country': 'ZZ', 'x-gclb-country': 'US', 'x-gclb-region': 'USTX' }, ['US', 'TX', 'x-gclb']],
+      [{}, { 'x-geo-country': 'DE', 'x-geo-region': 'Bavaria' }, ['DE', 'BAVARIA', 'x-geo']],
+      [{}, { 'x-gclb-country': 'US', 'x-gclb-region': 'USNY', 'cloudfront-viewer-country': 'US' }, ['US', 'NY', 'x-gclb']],
+      [{}, { 'cloudfront-viewer-country': 'US', 'cloudfront-viewer-country-region': 'WA' }, ['US', 'WA', 'cloudfront']],
+      [{}, { 'x-appengine-country': 'US', 'x-appengine-region': 'ca' }, ['US', 'CA', 'appengine']],
+      [{}, { 'x-azure-country': 'us', 'cf-ipcountry': 'BR' }, ['US', undefined, 'azure']],
+      [{}, { 'cf-ipcountry': 'US' }, ['US', undefined, 'cf']],
+      [{}, { 'cf-ipcountry': 'USA' }, [undefined, undefined, 'none']]
+    ].forEach((c) => {
+      const result = run({ eventData: c[0], headers: c[1] });
+      assertThat([result.country, result.region, result.geo_source]).isEqualTo(c[2]);
+    });
+
+    [['us', 'US-TX', 'US', 'TX'], ['US', 'texas', 'US', 'TX'], ['', 'CA', undefined, 'CA']].forEach((c) => {
+      const result = run({ eventData: { event_location: { country: 'BR', region: 'SP' } } }, { geoSource: 'custom', customCountry: c[0], customRegion: c[1] });
+      assertThat([result.country, result.region, result.geo_source]).isEqualTo([c[2], c[3], 'custom']);
+    });
+- name: '[Return Types] Each return type returns the matching value'
+  code: |-
+    [
+      ['decision', 'limited', 'allow'],
+      ['restricted', true, false],
+      ['metaDpo', ['LDU'], []],
+      ['metaDpoCountry', 0, undefined],
+      ['metaDpoState', 0, undefined],
+      ['googleAdsRdp', true, false],
+      ['tiktokLdu', true, false]
+    ].forEach((c) => {
+      assertThat(run(gpcHeader, { returnType: c[0] })).isEqualTo(c[1]);
+      assertThat(run({}, { returnType: c[0] })).isEqualTo(c[2]);
+    });
+    assertThat(run(gpcHeader, { returnType: 'decision', optOutAction: 'block' })).isEqualTo('block');
+    assertThat(run(gpcHeader, { optOutAction: 'block' }).vendor.tiktok.limited_data_use).isTrue();
+- name: '[Meta] United States mode sets country 1 and the Meta state code'
+  code: |-
+    [
+      ['CA', 1000], ['CO', 1001], ['CT', 1002], ['FL', 1003], ['OR', 1004], ['TX', 1005], ['MT', 1006],
+      ['DE', 1007], ['NE', 1008], ['NH', 1009], ['NJ', 1010], ['MN', 1011], ['MD', 1012], ['RI', 1013],
+      ['VA', 0], [undefined, 0]
+    ].forEach((c) => {
+      const meta = run(at('US', c[0]), { metaDpoMode: 'us' }).vendor.meta;
+      assertThat([meta.data_processing_options, meta.data_processing_options_country, meta.data_processing_options_state]).isEqualTo([['LDU'], 1, c[1]]);
+    });
+    assertThat(run(at('IT', 'CO'), { metaDpoMode: 'us', regionScope: 'everywhere' }).vendor.meta.data_processing_options_state).isEqualTo(0);
+    const geolocated = run(at('US', 'TX')).vendor.meta;
+    assertThat([geolocated.data_processing_options_country, geolocated.data_processing_options_state]).isEqualTo([0, 0]);
