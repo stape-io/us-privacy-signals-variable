@@ -1,0 +1,5 @@
+homepage: 'https://stape.io/'
+documentation: 'https://github.com/stape-io/us-privacy-signals-variable'
+versions:
+  - sha: c20121cb560b98b14e904de577180a1823b4774c
+    changeNotes: Initial release.
